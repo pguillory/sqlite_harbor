@@ -99,14 +99,20 @@ defmodule SqliteHarbor.Owner do
   def handle_call({:execute, _, _} = request, from, %{mode: :delete} = s),
     do: {:noreply, %{s | waiters: [{from, request} | s.waiters]}}
 
+  def handle_call({:execute, _, _, _} = request, from, %{mode: :delete} = s),
+    do: {:noreply, %{s | waiters: [{from, request} | s.waiters]}}
+
   def handle_call(:save, from, %{mode: :delete} = s),
     do: {:noreply, %{s | waiters: [{from, :save} | s.waiters]}}
 
-  def handle_call({:execute, statements, expiry}, _from, s) do
+  def handle_call({:execute, statements, expiry}, from, s),
+    do: handle_call({:execute, statements, expiry, :error}, from, s)
+
+  def handle_call({:execute, statements, expiry, row_limit}, _from, s) do
     started = System.monotonic_time(:millisecond)
     deadline = started + max(0, expiry - System.system_time(:millisecond))
     before = Files.size(Files.path(s.c, s.id) <> "-wal")
-    result = SQL.execute(s.db, statements, s.c, deadline, s.watchdog)
+    result = SQL.execute(s.db, statements, s.c, deadline, s.watchdog, row_limit)
     after_size = Files.size(Files.path(s.c, s.id) <> "-wal")
     s = if after_size > before, do: %{s | gen: s.gen + 1}, else: s
     if after_size >= 4 * 1024 * 1024, do: SQL.checkpoint(s.db)
@@ -138,21 +144,55 @@ defmodule SqliteHarbor.Owner do
 
   def handle_call(:delete, _from, s) do
     s = kill_upload(s)
+    caches = Cache.instances(s.c.name)
 
-    case Storage.call(s.c.storage, :delete, [Config.key(s.c, s.id)]) do
-      :ok ->
-        s = close(s)
-        drop_pending(s)
-        Files.remove_db(s.c, s.id)
-        Enum.each(s.waiters, fn {from, _} -> GenServer.reply(from, {:error, :not_found}) end)
-        {:stop, :normal, :ok, %{s | closed: true}}
+    try do
+      with :ok <- cache_calls(caches, :begin_delete, s.id),
+           :ok <- Storage.call(s.c.storage, :delete, [Config.key(s.c, s.id)]) do
+        # After remote deletion, even a partial cleanup failure must never take
+        # the normal termination path that saves the database again.
+        s = %{close(s) | closed: true, pending: nil}
 
-      {:error, reason} ->
+        local = cache_calls(caches, :purge, s.id)
+        remote = purge_conflicts(s.c, s.id, nil)
+        result = if local == :ok, do: remote, else: local
+        reason = if result == :ok, do: :not_found, else: elem(result, 1)
         Enum.each(s.waiters, fn {from, _} -> GenServer.reply(from, {:error, reason}) end)
+        {:stop, :normal, result, s}
+      else
+        {:error, reason} ->
+          Enum.each(s.waiters, fn {from, _} -> GenServer.reply(from, {:error, reason}) end)
 
-        if s.mode == :delete,
-          do: {:stop, :normal, {:error, reason}, s},
-          else: {:reply, {:error, reason}, timers(s)}
+          if s.mode == :delete,
+            do: {:stop, :normal, {:error, reason}, s},
+            else: {:reply, {:error, reason}, timers(s)}
+      end
+    after
+      cache_calls(caches, :end_delete, s.id)
+    end
+  end
+
+  defp cache_calls(caches, operation, id) do
+    # Visit every cache even if an earlier one fails, including when releasing
+    # exclusions after a lost response or a node disconnect.
+    Enum.reduce(caches, :ok, fn pid, result ->
+      current = Cache.deletion_call(pid, operation, id)
+      if result == :ok, do: current, else: result
+    end)
+  end
+
+  defp purge_conflicts(c, id, cursor) do
+    prefix = c.prefix <> "conflicts/" <> id <> "/"
+
+    with {:ok, keys, next} <- Storage.call(c.storage, :list, [prefix, cursor, 1000]),
+         :ok <-
+           Enum.reduce_while(keys, :ok, fn key, :ok ->
+             case Storage.call(c.storage, :delete, [prefix <> key]) do
+               :ok -> {:cont, :ok}
+               error -> {:halt, error}
+             end
+           end) do
+      if next, do: purge_conflicts(c, id, next), else: :ok
     end
   end
 
@@ -311,7 +351,7 @@ defmodule SqliteHarbor.Owner do
   end
 
   defp download(s, etag) do
-    path = Files.temp(s.c)
+    path = Files.temp(s.c, s.id)
     started = System.monotonic_time(:millisecond)
     result = Storage.call(s.c.storage, :get, [Config.key(s.c, s.id), path, etag])
 

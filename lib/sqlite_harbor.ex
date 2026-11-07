@@ -36,7 +36,7 @@ defmodule SqliteHarbor do
     end
   end
 
-  @doc "Deletes a database through its owner. Unknown IDs are idempotent successes."
+  @doc "Deletes the database and its conflict copies. Unknown IDs are idempotent successes."
   def delete(service, id) do
     with :ok <- check_id(id), do: call(Cache.config(service), id, :delete, :delete, 30_000)
   end
@@ -58,18 +58,29 @@ defmodule SqliteHarbor do
   Executes `[sql | {sql, list_or_map_params}]` as one transaction. Errors carry a
   zero-based statement index, code and message. timeout defaults to 30 seconds;
   the configured wall_timeout (10 seconds) also limits the total call.
+  `row_limit: :truncate` keeps at most max_rows rows across the call while finishing
+  every statement; omitted rows set that result's `truncated` flag. The default
+  `row_limit: :error` rolls the transaction back on overflow.
+  Byte/value limits, deadlines and SQL errors still roll back in truncate mode.
   """
   def execute(service, id, statements, opts \\ []) do
     c = Cache.config(service)
     timeout = Keyword.get(opts, :timeout, 30_000)
+    row_limit = Keyword.get(opts, :row_limit, :error)
 
     with :ok <- check_id(id),
          :ok <- inputs(statements, c),
+         :ok <- if(row_limit in [:error, :truncate], do: :ok, else: {:error, :invalid_row_limit}),
          true <- is_integer(timeout) and timeout > 0 do
       budget = min(timeout, c.wall_timeout)
       expiry = System.system_time(:millisecond) + budget
 
-      case call(c, id, {:execute, statements, expiry}, :normal, budget) do
+      request =
+        if row_limit == :error,
+          do: {:execute, statements, expiry},
+          else: {:execute, statements, expiry, row_limit}
+
+      case call(c, id, request, :normal, budget) do
         {:error, %{code: _}} = result -> result
         {:error, reason} -> {:error, SQL.error(nil, reason)}
         other -> other
@@ -163,7 +174,7 @@ defmodule SqliteHarbor do
   defp export_file(_c, _id, 0), do: {:error, :integrity_failure}
 
   defp export_file(c, id, attempts) do
-    path = Files.temp(c)
+    path = Files.temp(c, id)
 
     case Storage.call(c.storage, :get, [Config.key(c, id), path, nil]) do
       {:ok, etag} ->

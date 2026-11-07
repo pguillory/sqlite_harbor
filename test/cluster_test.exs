@@ -114,4 +114,45 @@ defmodule SqliteHarbor.ClusterTest do
     send(a, :stop)
     send(b, :stop)
   end
+
+  test "delete purges connected caches and truncation options reach remote owners", c do
+    [first, second] = c.peers
+    {:ok, id} = :erpc.call(first, Harbor, :create, [c.service])
+
+    assert {:ok, _} = :erpc.call(first, Harbor, :execute, [c.service, id, ["CREATE TABLE t(x)"]])
+
+    assert {:ok, [%{changes: 10001, truncated: true, rows: rows}]} =
+             :erpc.call(second, Harbor, :execute, [
+               c.service,
+               id,
+               [
+                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO t SELECT x FROM n RETURNING x"
+               ],
+               [row_limit: :truncate]
+             ])
+
+    assert length(rows) == 10000
+
+    paths =
+      for n <- [node() | c.peers] do
+        conf = :erpc.call(n, SqliteHarbor.Cache, :config, [c.service])
+        snapshot = SqliteHarbor.Files.snapshot(conf, id, "old")
+        conflict = Path.join([conf.cache_dir, "conflicts", id <> "--old"])
+        scratch = SqliteHarbor.Files.temp(conf, id)
+
+        for path <- [snapshot, conflict, scratch],
+            do: :ok = :erpc.call(n, File, :write, [path, "private"])
+
+        {n, [snapshot, conflict, scratch]}
+      end
+
+    assert :ok = :erpc.call(second, Harbor, :delete, [c.service, id])
+
+    for {n, local_paths} <- paths,
+        path <- local_paths,
+        do: refute(:erpc.call(n, File, :exists?, [path]))
+
+    assert {:error, %{code: :not_found}} =
+             :erpc.call(first, Harbor, :execute, [c.service, id, ["SELECT 1"]])
+  end
 end

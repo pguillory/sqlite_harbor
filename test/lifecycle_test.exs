@@ -199,6 +199,155 @@ defmodule SqliteHarbor.LifecycleTest do
     assert_rows(c.service, id, "SELECT x FROM t", [[1]])
   end
 
+  test "delete purges all conflict pages and local leftovers without touching another ID", c do
+    id = seeded(c)
+    {:ok, other} = Harbor.create(c.service)
+    conf = config(c.service)
+    object_root = Path.join(c.root, "objects")
+    remote_dir = Path.join([object_root, "test", "conflicts", id])
+    File.mkdir_p!(remote_dir)
+
+    for n <- 1..1001,
+        do:
+          File.write!(
+            Path.join(remote_dir, String.pad_leading(Integer.to_string(n), 4, "0")),
+            "private"
+          )
+
+    other_conflict = "test/conflicts/" <> other <> "/keep"
+    fixture = Path.join(c.root, "fixture")
+    File.write!(fixture, "other database")
+
+    {:ok, _} =
+      Local.put([root: object_root], other_conflict, fixture, :absent, Files.hash(fixture))
+
+    leftovers = [
+      Path.join([conf.cache_dir, "db", id <> ".meta.abandoned.tmp"]),
+      Path.join([conf.cache_dir, "db", id <> ".sqlite-journal"]),
+      Files.snapshot(conf, id, "orphan"),
+      Path.join([conf.cache_dir, "conflicts", id <> "--local"]),
+      Files.temp(conf, id)
+    ]
+
+    for path <- leftovers, do: File.write!(path, "private")
+    {:ok, _abandoned_export} = Harbor.export(c.service, id)
+    assert :ok = Harbor.delete(c.service, id)
+    assert :ok = Harbor.delete(c.service, id)
+    for path <- leftovers, do: refute(File.exists?(path))
+    refute File.exists?(Files.path(conf, id))
+    refute File.exists?(Files.meta_path(conf, id))
+    assert Path.wildcard(Path.join([conf.cache_dir, "tmp", id <> ".*"])) == []
+
+    assert {:ok, [], nil} =
+             Local.list([root: object_root], "test/conflicts/" <> id <> "/", nil, 100)
+
+    assert {:ok, _} = Local.head([root: object_root], other_conflict)
+    assert_rows(c.service, other, "SELECT 1", [[1]])
+
+    lists =
+      for {:list, [prefix, cursor, _]} <- Store.calls(c.store),
+          prefix == "test/conflicts/" <> id <> "/",
+          do: cursor
+
+    assert Enum.any?(lists, &is_binary/1)
+  end
+
+  test "delete cancels the current conflict upload before purging its object", c do
+    id = seeded(c)
+    conf = config(c.service)
+    path = Path.join([conf.cache_dir, "conflicts", id <> "--blocked"])
+    File.write!(path, "private")
+    key = "test/conflicts/" <> id <> "/blocked"
+    ref = make_ref()
+    Store.fault(c.store, :put, {:block, self(), ref}, key)
+    send(cache(c.service), :sweep)
+    assert_receive {:blocked, ^ref, uploader, _}, 5_000
+    monitor = Process.monitor(uploader)
+    assert :ok = Harbor.delete(c.service, id)
+    assert_receive {:DOWN, ^monitor, :process, ^uploader, :killed}
+    send(cache(c.service), :sweep)
+    eventually(fn -> :sys.get_state(cache(c.service)).conflict_task == nil end)
+    refute File.exists?(path)
+    assert {:error, :not_found} = Local.head([root: Path.join(c.root, "objects")], key)
+  end
+
+  test "conflict deletion and listing errors are retryable without reviving primary data", c do
+    for operation <- [:list, :delete] do
+      id = seeded(c)
+      conf = config(c.service)
+      path = Path.join([conf.cache_dir, "conflicts", id <> "--local"])
+      File.write!(path, "private")
+      key = "test/conflicts/" <> id <> "/remote"
+      root = Path.join(c.root, "objects")
+      {:ok, _} = Local.put([root: root], key, path, :absent, Files.hash(path))
+      fault_key = if operation == :list, do: "test/conflicts/" <> id <> "/", else: key
+      Store.fault(c.store, operation, {:error, :unavailable}, fault_key)
+      assert {:error, :unavailable} = Harbor.delete(c.service, id)
+      refute File.exists?(Files.path(conf, id))
+      assert {:error, :not_found} = Local.head([root: root], "test/db/" <> id)
+      assert {:error, %{code: :not_found}} = Harbor.execute(c.service, id, ["SELECT 1"])
+      assert :sys.get_state(cache(c.service)).deleting == %{}
+      assert :ok = Harbor.delete(c.service, id)
+      assert {:error, :not_found} = Local.head([root: root], key)
+    end
+  end
+
+  test "local cleanup errors after primary deletion never save the primary again", c do
+    id = seeded(c)
+    conf = config(c.service)
+    bad_path = Path.join([conf.cache_dir, "db", id <> ".meta.directory.tmp"])
+    File.mkdir!(bad_path)
+    assert {:error, {:local_cleanup, _}} = Harbor.delete(c.service, id)
+
+    assert {:error, :not_found} =
+             Local.head([root: Path.join(c.root, "objects")], "test/db/" <> id)
+
+    eventually(fn -> owner(c.service, id) == :undefined end)
+    File.rmdir!(bad_path)
+    assert :ok = Harbor.delete(c.service, id)
+  end
+
+  test "a crashed deleting owner releases every cache exclusion", c do
+    id = seeded(c)
+    ref = make_ref()
+    Store.fault(c.store, :delete, {:block, self(), ref})
+    deleting = Task.async(fn -> Harbor.delete(c.service, id) end)
+    assert_receive {:blocked, ^ref, deleter, _}, 5_000
+    assert Map.has_key?(:sys.get_state(cache(c.service)).deleting, id)
+    Process.exit(deleter, :kill)
+    assert {:error, :unknown_outcome} = Task.await(deleting)
+    eventually(fn -> :sys.get_state(cache(c.service)).deleting == %{} end)
+    assert_rows(c.service, id, "SELECT x FROM t", [[1]])
+  end
+
+  test "a later sweep discards offline conflict leftovers only after primary absence is confirmed",
+       c do
+    {:ok, id} = Harbor.create(c.service)
+    assert :ok = Harbor.delete(c.service, id)
+    conf = config(c.service)
+    path = Path.join([conf.cache_dir, "conflicts", id <> "--offline"])
+    unknown = Path.join([conf.cache_dir, "conflicts", "000-unrecognized-file"])
+    File.write!(unknown, "preserve unknown files without blocking valid rescues")
+    File.write!(path, "private")
+    ref = make_ref()
+    Store.fault(c.store, :head, {:error, :unavailable}, "test/db/" <> id)
+    send(cache(c.service), :sweep)
+    eventually(fn -> :sys.get_state(cache(c.service)).conflict_task == nil end)
+    assert File.exists?(path)
+    Store.fault(c.store, :head, {:block, self(), ref}, "test/db/" <> id)
+    send(cache(c.service), :sweep)
+    assert_receive {:blocked, ^ref, sweeper, _}, 5_000
+    send(sweeper, {:release, ref})
+    eventually(fn -> not File.exists?(path) end)
+    assert File.exists?(unknown)
+
+    assert {:error, :not_found} =
+             Local.head(
+               [root: Path.join(c.root, "objects")],
+               "test/conflicts/" <> id <> "/offline"
+             )
+  end
+
   test "a live export stream survives Cache restarting in the same VM", c do
     id = seeded(c)
     {:ok, stream} = Harbor.export(c.service, id)

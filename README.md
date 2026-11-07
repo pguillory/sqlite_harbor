@@ -66,13 +66,14 @@ SqliteHarbor.create(service)                         # {:ok, uuid}
 SqliteHarbor.delete(service, uuid)                   # :ok, also when already absent
 SqliteHarbor.list(service, nil, 100)                 # {:ok, [uuid], next_cursor}
 SqliteHarbor.execute(service, uuid, statements, timeout: 5_000)
+SqliteHarbor.execute(service, uuid, statements, row_limit: :truncate)
 SqliteHarbor.export(service, uuid)                   # {:ok, binary_chunk_stream}
 SqliteHarbor.import(service, path_or_chunk_stream)   # {:ok, new_uuid}
 ```
 
 Non-execute storage and validation failures return `{:error, reason}`. Execute errors are
 `{:error, %{statement: zero_based_index_or_nil, code: atom, message: text}}`.
-Each result has `columns`, `rows`, `changes`, and `last_insert_rowid`. Changes count
+Each result has `columns`, `rows`, `changes`, `last_insert_rowid`, and `truncated`. Changes count
 the statement's direct and trigger writes; reads and DDL report zero. The row ID is
 SQLite's most recent successful insert on that connection.
 Params are lists or maps with SQLite parameter names as binary keys (such as `":id"`).
@@ -81,9 +82,15 @@ are both returned as binaries, as in exqlite; output blob tagging is deferred.
 
 **A list is one transaction.** The first failure rolls it back. Each SQL string must
 contain exactly one statement; triggers can contain their normal SQL body. BEGIN,
-COMMIT, ROLLBACK, SAVEPOINT, ATTACH, DETACH, all PRAGMAs and TEMP objects are refused
-through SQLite's authorizer, including table-valued PRAGMAs. Use `sqlite_schema` for
-schema inspection. VACUUM (including INTO) fails inside the transaction. Extensions
+COMMIT, ROLLBACK, SAVEPOINT, ATTACH, DETACH and TEMP objects are refused
+through SQLite's authorizer. Schema inspection also accepts `PRAGMA table_info('table')`,
+`table_xinfo`, `index_list`, `index_info`, and `foreign_key_list`, with the same
+parenthesized table/index argument. The argument can be a bare identifier or a quoted
+name (including escaped quotes); optional `main.`, surrounding whitespace and a trailing
+semicolon are accepted. Other PRAGMAs, assignment syntax,
+and table-valued PRAGMAs remain refused. Comments inside or following an otherwise
+allowed PRAGMA are refused as well. `sqlite_schema` is also available.
+VACUUM (including INTO) fails inside the transaction. Extensions
 are disabled. `trusted_schema=OFF` applies to every connection.
 
 Export activates the owner, adopts any local crash leftovers, saves, then downloads
@@ -96,6 +103,23 @@ Delete and the export-save phase each have a fixed 30-second caller timeout. A t
 or storage transport error can leave an operation's outcome unknown; deletion is
 idempotent, and repeating it confirms absence. Queued execute requests expire without
 running, but a commit already in progress may complete at the deadline.
+
+By default, exceeding `max_rows` fails with `:result_too_large` and rolls back the
+transaction. Pass `row_limit: :truncate` to return at most `max_rows` rows across the
+whole call and set `truncated: true` on each statement that omitted rows. Statements
+still run to completion, including writes with `RETURNING` and later statements, then
+commit. An exact fit has `truncated: false`. Discarded rows do not consume the returned
+byte budget, but each discarded row remains bounded by `max_result_bytes` before it
+is copied from SQLite. Value limits, returned byte limits, deadlines and SQL errors
+still fail and roll back the whole transaction.
+An unsupported `row_limit` value returns `:invalid_row_limit` before execution.
+
+Delete removes the primary object, every current object under `conflicts/ID/`, and
+ID-specific database files, sidecars, metadata, snapshots, conflicts and download/export
+scratch files on connected caches. It coordinates with conflict uploads and returns an
+error if any purge step fails; repeat delete to finish a partial purge. Large purges
+can exceed the fixed caller timeout while continuing in the owner. All cluster nodes
+must run the same library version.
 
 ## Durability and limits
 
@@ -142,7 +166,14 @@ Results are checked one row at a time before the following row is evaluated, wit
 remaining aggregate byte budget enforced inside the NIF before any cell copies.
 SQL sorters can spill to the OS temporary directory within the execution deadline;
 the database page cap does not bound those temporary spill files.
-Deleting a database does not delete earlier human-review copies under `conflicts/`.
+Disconnected/offline disks cannot be erased until they return: missing primary objects
+cause dirty database recovery and conflict sweeps to discard old copies; clean cached
+databases are removed at activation or eviction. An already-sent upload or download can
+still land after delete, so retry deletion after reconnecting nodes and settling such
+requests. Bucket version history, replicas, external exports and backups require the
+host's own retention/deletion policy. Configure a stable bucket and prefix: a missing
+primary means deletion, and the sweep discards local conflicts with a
+`:conflict_discarded` telemetry event.
 
 The disk must hold active databases, WAL/temp files and one immutable snapshot per
 saving owner, plus clean cache and pending conflict rescues. Dirty files are never

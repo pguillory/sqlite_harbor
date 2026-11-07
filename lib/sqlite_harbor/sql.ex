@@ -19,6 +19,10 @@ defmodule SqliteHarbor.SQL do
     :drop_temp_view
   ]
 
+  # The driver authorizer can deny actions, but cannot allow individual PRAGMA
+  # names. Only this complete, side-effect-free grammar may lift that denial.
+  @schema_pragma ~r/\A\s*PRAGMA\s+(?:main\s*\.\s*)?(table_info|table_xinfo|index_list|index_info|foreign_key_list)\s*\(\s*('(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*)\s*\)\s*;?\s*\z/i
+
   def initialize(path, max_value_bytes \\ 10_000_000) do
     with {:ok, db} <- DB.open(path) do
       try do
@@ -112,7 +116,7 @@ defmodule SqliteHarbor.SQL do
     end
   end
 
-  def execute(db, statements, c, deadline, watchdog) do
+  def execute(db, statements, c, deadline, watchdog, row_limit \\ :error) do
     token = make_ref()
     :ok = Watchdog.arm(watchdog, db, deadline, token)
 
@@ -127,7 +131,7 @@ defmodule SqliteHarbor.SQL do
         |> Enum.with_index()
         |> Enum.reduce({[], 0, 0}, fn {item, index}, {results, rows, bytes} ->
           try do
-            {result, count, size} = statement(db, item, c, deadline, rows, bytes)
+            {result, count, size} = statement(db, item, c, deadline, rows, bytes, row_limit)
             {[result | results], count, size}
           catch
             {:sql_error, reason} -> throw({:batch_error, error(index, reason)})
@@ -161,57 +165,85 @@ defmodule SqliteHarbor.SQL do
     end
   end
 
-  defp statement(db, item, c, deadline, row_count, byte_count) do
+  defp statement(db, item, c, deadline, row_count, byte_count, row_limit) do
     check_deadline(deadline)
     {sql, params} = if is_binary(item), do: {item, []}, else: item
-    stmt = must(DB.prepare_single(db, sql))
+    {sql, denied} = authorized_sql(sql)
+    :ok = DB.set_authorizer(db, denied)
 
     try do
-      must(DB.bind(stmt, params))
-      {:ok, [[before_changes]]} = query(db, "SELECT total_changes()")
-      columns = must(DB.columns(db, stmt))
-      column_bytes = Enum.reduce(columns, 0, &(byte_size(&1) + &2))
-      byte_count = byte_count + column_bytes
-      if byte_count > c.max_result_bytes, do: throw({:sql_error, :result_too_large})
-      {rows, count, bytes} = rows(db, stmt, c, deadline, [], row_count, byte_count)
-      {:ok, [[after_changes]]} = query(db, "SELECT total_changes()")
-      changes = after_changes - before_changes
-      rowid = must(DB.last_insert_rowid(db))
-      {%{columns: columns, rows: rows, changes: changes, last_insert_rowid: rowid}, count, bytes}
+      if denied != @denied and params not in [[], %{}],
+        do: throw({:sql_error, :invalid_params})
+
+      stmt = must(DB.prepare_single(db, sql))
+
+      try do
+        must(DB.bind(stmt, params))
+        {:ok, [[before_changes]]} = query(db, "SELECT total_changes()")
+        columns = must(DB.columns(db, stmt))
+        column_bytes = Enum.reduce(columns, 0, &(byte_size(&1) + &2))
+        byte_count = byte_count + column_bytes
+        if byte_count > c.max_result_bytes, do: throw({:sql_error, :result_too_large})
+
+        {rows, count, bytes, truncated} =
+          rows(db, stmt, c, deadline, [], row_count, byte_count, row_limit, false)
+
+        {:ok, [[after_changes]]} = query(db, "SELECT total_changes()")
+        changes = after_changes - before_changes
+        rowid = must(DB.last_insert_rowid(db))
+
+        {%{
+           columns: columns,
+           rows: rows,
+           changes: changes,
+           last_insert_rowid: rowid,
+           truncated: truncated
+         }, count, bytes}
+      after
+        DB.release(db, stmt)
+      end
     rescue
       e in [ArgumentError, Exqlite.Error] -> throw({:sql_error, Exception.message(e)})
     after
-      DB.release(db, stmt)
+      DB.set_authorizer(db, @denied)
     end
   end
 
-  defp rows(db, stmt, c, deadline, acc, count, bytes) do
+  defp authorized_sql(sql) do
+    case Regex.run(@schema_pragma, sql, capture: :all_but_first) do
+      [name, argument] ->
+        {"PRAGMA main.#{String.downcase(name)}(#{argument})", List.delete(@denied, :pragma)}
+
+      nil ->
+        {sql, @denied}
+    end
+  end
+
+  defp rows(db, stmt, c, deadline, acc, count, bytes, row_limit, truncated) do
     check_deadline(deadline)
+    discard = row_limit == :truncate and count >= c.max_rows
+    budget = if discard, do: c.max_result_bytes, else: c.max_result_bytes - bytes
 
     # The native budget preflights every column before copying any result cells.
-    # A per-value limit alone cannot bound a SELECT with many repeated columns.
-    {done, chunk} =
-      case DB.step(db, stmt, c.max_result_bytes - bytes) do
-        :done -> {true, []}
-        {:row, row} -> {false, [row]}
-        {:error, reason} -> throw({:sql_error, reason})
-        :busy -> throw({:sql_error, :busy})
-      end
+    # Discarded rows have the same per-row bound but consume no retained budget.
+    case DB.step(db, stmt, budget) do
+      :done ->
+        {Enum.reverse(acc), count, bytes, truncated}
 
-    count = count + length(chunk)
+      {:row, _row} when discard ->
+        rows(db, stmt, c, deadline, acc, count, bytes, row_limit, true)
 
-    bytes =
-      bytes +
-        Enum.reduce(chunk, 0, fn row, n -> n + Enum.reduce(row, 0, &(value_bytes(&1) + &2)) end)
+      {:row, row} ->
+        if count >= c.max_rows, do: throw({:sql_error, :result_too_large})
+        bytes = bytes + Enum.reduce(row, 0, &(value_bytes(&1) + &2))
+        rows(db, stmt, c, deadline, [row | acc], count + 1, bytes, row_limit, truncated)
 
-    if count > c.max_rows or bytes > c.max_result_bytes,
-      do: throw({:sql_error, :result_too_large})
+      {:error, reason} ->
+        throw({:sql_error, reason})
 
-    acc = [chunk | acc]
-
-    if done,
-      do: {acc |> Enum.reverse() |> Enum.concat(), count, bytes},
-      else: rows(db, stmt, c, deadline, acc, count, bytes)
+      :busy ->
+        throw({:sql_error, :busy})
+    end
   end
 
   def value_bytes(nil), do: 1

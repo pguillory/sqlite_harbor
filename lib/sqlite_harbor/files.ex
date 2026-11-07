@@ -5,6 +5,7 @@ defmodule SqliteHarbor.Files do
   def snapshot(c, id, md5), do: Path.join([c.cache_dir, "snapshots", id <> "." <> md5])
   def unique, do: Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
   def temp(c), do: Path.join([c.cache_dir, "tmp", unique()])
+  def temp(c, id), do: Path.join([c.cache_dir, "tmp", id <> "." <> unique()])
 
   def init(c) do
     for dir <- ["db", "snapshots", "tmp", "conflicts"],
@@ -99,6 +100,21 @@ defmodule SqliteHarbor.Files do
   end
 
   def scratch_remove(path), do: Enum.each([path, path <> "-wal", path <> "-shm"], &remove/1)
+
+  def purge(c, id) do
+    for {dir, pattern} <- [
+          {"db", id <> ".*"},
+          {"snapshots", id <> ".*"},
+          {"conflicts", id <> "--*"},
+          {"tmp", id <> ".*"}
+        ] do
+      directory = Path.join(c.cache_dir, dir)
+      for path <- Path.wildcard(Path.join(directory, pattern)), do: remove(path)
+      sync_dir(directory)
+    end
+
+    :ok
+  end
 
   def dirty?(c, id) do
     case meta(c, id) do

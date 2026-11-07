@@ -10,7 +10,9 @@ Mount a writable, durable cache directory exclusively for each node/instance, wi
 enough space for active files, snapshots, WAL/temp work, clean cache and unsent rescues.
 Use one bucket prefix only with matching cluster service names/configuration. Do not
 edit, expire, multipart-upload or overwrite library primary objects out of band. Preserve
-conflict objects for human review; recovery does not merge databases.
+conflict objects for human review; recovery does not merge databases. Delete intentionally
+purges those copies too. A missing primary makes conflict sweeps discard local rescues,
+so changing a bucket or prefix requires preserving/migrating needed files first.
 
 At deployment, let the supervision tree shut down normally. Configure shutdown_timeout
 to cover the workload's dirty bytes divided by measured upload bandwidth; the default
@@ -34,6 +36,7 @@ parameter values are not emitted. Measures include duration_ms or bytes where re
 | save | One snapshot upload attempt, bytes/time/outcome |
 | unsaved | An owner could not complete its save |
 | conflict | Latest losing file quarantined; **alert** |
+| conflict_discarded | Local rescue removed because the primary no longer exists |
 | adoption | Dirty file reopened after interruption |
 | adoption_stranded | Another node owns a database with local dirty leftovers |
 | adoption_failed | Recovery owner crashed again; **alert** |
@@ -59,4 +62,6 @@ No migration or backfill. The host supplies storage credentials, a cache mount, 
 name/prefix, discovery, clock synchronization, telemetry handlers, and a suitable shutdown
 budget. Verify bucket conditions before adoption, then create/write/export/import/delete
 one throwaway database. Check conflict/unsaved/adoption_failed events remain absent during
-normal use. SqliteHarbor itself does not deploy anything.
+normal use. Upgrade every node to the same library version, restarting the VMs so boot
+cleanup also removes scratch files from versions that did not tag downloads with an ID.
+SqliteHarbor itself does not deploy anything.

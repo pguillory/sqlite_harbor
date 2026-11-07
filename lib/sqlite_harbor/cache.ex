@@ -11,6 +11,19 @@ defmodule SqliteHarbor.Cache do
   def checkin(pid, id), do: GenServer.call(pid, {:checkin, id}, :infinity)
   def drain(pid), do: GenServer.call(pid, :drain, :infinity)
 
+  def instances(service) do
+    for {__MODULE__, _node, ^service} = name <- :global.registered_names(),
+        pid = :global.whereis_name(name),
+        is_pid(pid),
+        do: pid
+  end
+
+  def deletion_call(pid, operation, id) do
+    GenServer.call(pid, {operation, id}, :infinity)
+  catch
+    :exit, reason -> {:error, {:cache_unavailable, reason}}
+  end
+
   def init(c) do
     Process.flag(:trap_exit, true)
     Files.init(c)
@@ -25,6 +38,7 @@ defmodule SqliteHarbor.Cache do
        draining: false,
        recovering: MapSet.new(),
        failed: MapSet.new(),
+       deleting: %{},
        sweep_timer: nil,
        conflict_task: nil,
        recovery_tasks: %{},
@@ -35,12 +49,55 @@ defmodule SqliteHarbor.Cache do
   def handle_call(:config, _from, s), do: {:reply, s.c, s}
   def handle_call(:drain, _from, s), do: {:reply, :ok, %{s | draining: true}}
 
+  def handle_call({:begin_delete, id}, {pid, _}, s) do
+    holder = s.held[id]
+
+    cond do
+      :global.whereis_name(Owner.name(s.c.name, id)) != pid ->
+        {:reply, {:error, :not_owner}, s}
+
+      holder && holder != pid && Process.alive?(holder) ->
+        {:reply, {:error, :in_use}, s}
+
+      true ->
+        s = stop_conflict_task(s)
+        s = end_delete(s, id)
+        ref = Process.monitor(pid)
+        {:reply, :ok, %{s | deleting: Map.put(s.deleting, id, {pid, ref})}}
+    end
+  end
+
+  def handle_call({:purge, id}, {pid, _}, s) do
+    case s.deleting[id] do
+      {^pid, _ref} ->
+        result =
+          try do
+            Files.purge(s.c, id)
+          rescue
+            e in File.Error -> {:error, {:local_cleanup, e.reason}}
+          end
+
+        {:reply, result, s}
+
+      _ ->
+        {:reply, {:error, :not_owner}, s}
+    end
+  end
+
+  def handle_call({:end_delete, id}, {pid, _}, s) do
+    s = if match?({^pid, _}, s.deleting[id]), do: end_delete(s, id), else: s
+    {:reply, :ok, s}
+  end
+
   def handle_call({:checkout, id}, {pid, _}, s) do
     holder = s.held[id]
 
     cond do
       s.draining ->
         {:reply, {:error, :draining}, s}
+
+      Map.has_key?(s.deleting, id) ->
+        {:reply, {:error, :deleting}, s}
 
       :global.whereis_name(Owner.name(s.c.name, id)) != pid ->
         {:reply, {:error, :not_owner}, s}
@@ -68,6 +125,12 @@ defmodule SqliteHarbor.Cache do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, s) do
+    s =
+      Enum.reduce(s.deleting, s, fn
+        {id, {_pid, ^ref}}, s -> end_delete(s, id)
+        _, s -> s
+      end)
+
     case Map.fetch(s.refs, ref) do
       {:ok, id} ->
         repeated = MapSet.member?(s.recovering, id)
@@ -139,7 +202,13 @@ defmodule SqliteHarbor.Cache do
 
   def handle_info({ref, :swept}, s) when is_reference(ref) do
     Process.demonitor(ref, [:flush])
-    {:noreply, %{s | tasks: Map.delete(s.tasks, ref), conflict_task: nil}}
+
+    {:noreply,
+     %{
+       s
+       | tasks: Map.delete(s.tasks, ref),
+         conflict_task: if(s.conflict_task == ref, do: nil, else: s.conflict_task)
+     }}
   end
 
   def handle_info({:EXIT, _pid, :normal}, s), do: {:noreply, s}
@@ -161,9 +230,33 @@ defmodule SqliteHarbor.Cache do
     %{s | held: Map.delete(s.held, id), refs: Map.drop(s.refs, refs)}
   end
 
+  defp end_delete(s, id) do
+    if entry = s.deleting[id], do: Process.demonitor(elem(entry, 1), [:flush])
+    %{s | deleting: Map.delete(s.deleting, id)}
+  end
+
+  defp stop_conflict_task(%{conflict_task: nil} = s), do: s
+
+  defp stop_conflict_task(s) do
+    ref = s.conflict_task
+
+    if pid = s.tasks[ref] do
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _} -> :ok
+      end
+    end
+
+    Process.demonitor(ref, [:flush])
+    %{s | conflict_task: nil, tasks: Map.delete(s.tasks, ref)}
+  end
+
   defp maybe_recover(s, id) do
     cond do
-      s.draining or Map.has_key?(s.held, id) or MapSet.member?(s.recovering, id) or
+      s.draining or Map.has_key?(s.deleting, id) or Map.has_key?(s.held, id) or
+        MapSet.member?(s.recovering, id) or
           MapSet.member?(s.failed, id) ->
         s
 
@@ -247,22 +340,34 @@ defmodule SqliteHarbor.Cache do
       s
     else
       c = s.c
+      deleting = s.deleting
 
       task =
         Task.async(fn ->
           for path <- Path.wildcard(Path.join([c.cache_dir, "conflicts", "*"])),
-              File.regular?(path) do
-            key =
-              c.prefix <>
-                "conflicts/" <> String.replace(Path.basename(path), "--", "/", global: false)
-
-            case Storage.call(c.storage, :put, [key, path, :absent, Files.hash(path)]) do
-              {:ok, _} ->
+              File.regular?(path),
+              [id, suffix] <- [String.split(Path.basename(path), "--", parts: 2)],
+              SqliteHarbor.valid_id?(id),
+              not Map.has_key?(deleting, id) do
+            case Storage.call(c.storage, :head, [Config.key(c, id)]) do
+              {:error, :not_found} ->
                 Files.remove(path)
+                Config.event(:conflict_discarded, %{}, %{service: c.name, id: id, file: path})
 
-              {:error, :precondition_failed} ->
-                if Storage.call(c.storage, :head, [key]) == {:ok, Files.hash(path)},
-                  do: Files.remove(path)
+              {:ok, _} ->
+                key = c.prefix <> "conflicts/" <> id <> "/" <> suffix
+                md5 = Files.hash(path)
+
+                case Storage.call(c.storage, :put, [key, path, :absent, md5]) do
+                  {:ok, _} ->
+                    Files.remove(path)
+
+                  {:error, :precondition_failed} ->
+                    if Storage.call(c.storage, :head, [key]) == {:ok, md5}, do: Files.remove(path)
+
+                  {:error, _} ->
+                    :ok
+                end
 
               {:error, _} ->
                 :ok

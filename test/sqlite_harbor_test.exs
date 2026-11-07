@@ -92,6 +92,198 @@ defmodule SqliteHarborTest do
     assert {:error, :invalid_source} = Harbor.import(c.service, [:invalid])
   end
 
+  test "only the five parenthesized schema inspection pragmas are allowed", c do
+    {:ok, id} = Harbor.create(c.service)
+
+    assert {:ok, _} =
+             Harbor.execute(c.service, id, [
+               "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+               "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id), doubled AS (id * 2))",
+               "CREATE INDEX child_parent ON child(parent_id)",
+               "CREATE TABLE \"odd'name\"(x)",
+               "CREATE TABLE \"a; PRAGMA user_version=7\"(x)"
+             ])
+
+    assert {:ok, [info, extended, indexes, index, foreign]} =
+             Harbor.execute(c.service, id, [
+               "PrAgMa MAIN.table_info('child'); ",
+               "PRAGMA table_xinfo(child)",
+               "PRAGMA index_list(\"child\")",
+               "PRAGMA index_info(`child_parent`)",
+               "PRAGMA foreign_key_list([child])"
+             ])
+
+    assert Enum.map(info.rows, &Enum.at(&1, 1)) == ["id", "parent_id"]
+    assert Enum.map(extended.rows, &Enum.at(&1, 1)) == ["id", "parent_id", "doubled"]
+    assert Enum.any?(indexes.rows, &(Enum.at(&1, 1) == "child_parent"))
+    assert index.rows == [[0, 1, "parent_id"]]
+    assert Enum.any?(foreign.rows, &(Enum.at(&1, 2) == "parent"))
+    assert_rows(c.service, id, "PRAGMA table_info('odd''name')", [[0, "x", "", 0, nil, 0]])
+    assert_rows(c.service, id, "PRAGMA main.table_info(`odd'name`)", [[0, "x", "", 0, nil, 0]])
+
+    assert {:ok, _} = Harbor.execute(c.service, id, ["CREATE TABLE \"a`b\"(x)"])
+    assert_rows(c.service, id, "PRAGMA table_info(`a``b`)", [[0, "x", "", 0, nil, 0]])
+
+    assert_rows(c.service, id, "PRAGMA table_info('a; PRAGMA user_version=7')", [
+      [0, "x", "", 0, nil, 0]
+    ])
+
+    for sql <- [
+          "PRAGMA user_version=7",
+          "PRAGMA journal_mode(DELETE)",
+          "PRAGMA trusted_schema=ON",
+          "PRAGMA max_page_count=999999",
+          "PRAGMA writable_schema=ON",
+          "PRAGMA foreign_keys=OFF",
+          "PRAGMA table_info = child",
+          "PRAGMA table_info('child'); PRAGMA user_version=7",
+          "PRAGMA table_info('child'); SELECT 1",
+          "PRAGMA table_info('child') /* outside the accepted grammar */",
+          "PRAGMA temp.table_info('child')",
+          "SELECT * FROM pragma_table_info('child')"
+        ] do
+      assert {:error, %{statement: 0}} = Harbor.execute(c.service, id, [sql]), sql
+    end
+
+    assert {:error, %{code: :invalid_params}} =
+             Harbor.execute(c.service, id, [{"PRAGMA table_info('child')", ["ignored"]}])
+
+    # The relaxed authorizer must end with the introspection statement.
+    assert {:error, %{statement: 1, code: :unauthorized}} =
+             Harbor.execute(c.service, id, ["PRAGMA table_info('child')", "PRAGMA user_version=7"])
+
+    assert_rows(c.service, id, "SELECT 1", [[1]])
+  end
+
+  test "opt-in row truncation finishes RETURNING writes and preserves batch semantics", c do
+    opts =
+      c.opts
+      |> Keyword.put(:name, :harbor_truncate_test)
+      |> Keyword.put(:cache_dir, Path.join(c.root, "truncated"))
+      |> Keyword.merge(max_rows: 2, max_result_bytes: 100)
+
+    start_supervised!({Harbor, opts})
+    service = :harbor_truncate_test
+    {:ok, id} = Harbor.create(service)
+    assert {:ok, _} = Harbor.execute(service, id, ["CREATE TABLE t(x)"])
+
+    assert {:error, %{code: :result_too_large}} =
+             Harbor.execute(service, id, ["INSERT INTO t VALUES(1),(2),(3) RETURNING x"])
+
+    assert_rows(service, id, "SELECT count(*) FROM t", [[0]])
+
+    assert {:ok, [insert, read, write]} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "INSERT INTO t VALUES(1),(2),(3) RETURNING x",
+                 "SELECT x FROM t ORDER BY x",
+                 "INSERT INTO t VALUES(4)"
+               ],
+               row_limit: :truncate
+             )
+
+    assert length(insert.rows) == 2
+    assert insert.truncated
+    assert insert.changes == 3
+    assert insert.last_insert_rowid == 3
+    assert read.rows == [] and read.truncated and read.changes == 0
+    assert write.rows == [] and not write.truncated and write.changes == 1
+    assert_rows(service, id, "SELECT count(*) FROM t", [[4]])
+
+    assert {:error, %{statement: 1, code: :result_too_large}} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "INSERT INTO t VALUES(9) RETURNING hex(zeroblob(25)) AS x",
+                 "SELECT hex(zeroblob(25)) AS x"
+               ],
+               row_limit: :truncate
+             )
+
+    assert_rows(service, id, "SELECT count(*) FROM t", [[4]])
+
+    assert {:ok, [first, second, empty]} =
+             Harbor.execute(service, id, ["SELECT 1", "SELECT 2", "SELECT x FROM t WHERE 0"],
+               row_limit: :truncate
+             )
+
+    assert first.rows == [[1]] and not first.truncated
+    assert second.rows == [[2]] and not second.truncated
+    refute empty.truncated
+
+    assert {:ok, [%{rows: [[1], [2]], truncated: false}]} =
+             Harbor.execute(service, id, ["SELECT 1 UNION ALL SELECT 2"], row_limit: :truncate)
+
+    # Discarded rows do not consume the retained byte budget; each native step
+    # remains bounded even after the row cap is reached.
+    assert {:ok, [%{rows: rows, truncated: true}]} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100) SELECT x FROM n"
+               ],
+               row_limit: :truncate
+             )
+
+    assert rows == [[1], [2]]
+
+    assert {:error, %{statement: 1}} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "INSERT INTO t VALUES(5),(6),(7) RETURNING x",
+                 "INSERT INTO missing VALUES(1)"
+               ],
+               row_limit: :truncate
+             )
+
+    assert_rows(service, id, "SELECT count(*) FROM t", [[4]])
+
+    assert {:error, %{code: :result_too_large}} =
+             Harbor.execute(service, id, ["SELECT hex(zeroblob(100))"], row_limit: :truncate)
+
+    assert {:error, %{code: :result_too_large}} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT zeroblob(101)"
+               ],
+               row_limit: :truncate
+             )
+
+    assert {:error, %{code: :sql_error}} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "WITH n(x) AS (VALUES(1),(2),(3)) SELECT CASE x WHEN 3 THEN json('invalid') ELSE x END FROM n"
+               ],
+               row_limit: :truncate
+             )
+
+    assert {:error, %{code: :timeout}} =
+             Harbor.execute(
+               service,
+               id,
+               [
+                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT x FROM n"
+               ],
+               row_limit: :truncate,
+               timeout: 50
+             )
+
+    assert {:error, %{code: :invalid_row_limit}} =
+             Harbor.execute(service, id, ["INSERT INTO t VALUES(8)"], row_limit: :ignore)
+
+    assert_rows(service, id, "SELECT count(*) FROM t", [[4]])
+  end
+
   test "export retries a corrupted transfer and checks integrity", c do
     {:ok, id} = Harbor.create(c.service)
     assert_rows(c.service, id, "SELECT 1", [[1]])
