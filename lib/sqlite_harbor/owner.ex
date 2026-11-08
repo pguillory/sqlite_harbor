@@ -2,7 +2,7 @@ defmodule SqliteHarbor.Owner do
   @moduledoc false
   use GenServer, restart: :temporary
   alias Exqlite.Sqlite3, as: DB
-  alias SqliteHarbor.{Cache, Config, Files, SQL, Storage, Watchdog}
+  alias SqliteHarbor.{Cache, Config, Deletion, Files, SQL, Storage, Watchdog}
 
   def name(service, id), do: {SqliteHarbor, service, id}
 
@@ -147,15 +147,12 @@ defmodule SqliteHarbor.Owner do
     caches = Cache.instances(s.c.name)
 
     try do
-      with :ok <- cache_calls(caches, :begin_delete, s.id),
-           :ok <- Storage.call(s.c.storage, :delete, [Config.key(s.c, s.id)]) do
+      with :ok <- Deletion.exclude(caches, s.c, s.id) do
         # After remote deletion, even a partial cleanup failure must never take
         # the normal termination path that saves the database again.
         s = %{close(s) | closed: true, pending: nil}
 
-        local = cache_calls(caches, :purge, s.id)
-        remote = purge_conflicts(s.c, s.id, nil)
-        result = if local == :ok, do: remote, else: local
+        result = Deletion.purge(caches, s.c, s.id)
         reason = if result == :ok, do: :not_found, else: elem(result, 1)
         Enum.each(s.waiters, fn {from, _} -> GenServer.reply(from, {:error, reason}) end)
         {:stop, :normal, result, s}
@@ -168,31 +165,7 @@ defmodule SqliteHarbor.Owner do
             else: {:reply, {:error, reason}, timers(s)}
       end
     after
-      cache_calls(caches, :end_delete, s.id)
-    end
-  end
-
-  defp cache_calls(caches, operation, id) do
-    # Visit every cache even if an earlier one fails, including when releasing
-    # exclusions after a lost response or a node disconnect.
-    Enum.reduce(caches, :ok, fn pid, result ->
-      current = Cache.deletion_call(pid, operation, id)
-      if result == :ok, do: current, else: result
-    end)
-  end
-
-  defp purge_conflicts(c, id, cursor) do
-    prefix = c.prefix <> "conflicts/" <> id <> "/"
-
-    with {:ok, keys, next} <- Storage.call(c.storage, :list, [prefix, cursor, 1000]),
-         :ok <-
-           Enum.reduce_while(keys, :ok, fn key, :ok ->
-             case Storage.call(c.storage, :delete, [prefix <> key]) do
-               :ok -> {:cont, :ok}
-               error -> {:halt, error}
-             end
-           end) do
-      if next, do: purge_conflicts(c, id, next), else: :ok
+      Deletion.release(caches, s.id)
     end
   end
 

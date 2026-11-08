@@ -348,36 +348,39 @@ defmodule SqliteHarbor.Cache do
               File.regular?(path),
               [id, suffix] <- [String.split(Path.basename(path), "--", parts: 2)],
               SqliteHarbor.valid_id?(id),
-              not Map.has_key?(deleting, id) do
-            case Storage.call(c.storage, :head, [Config.key(c, id)]) do
-              {:error, :not_found} ->
-                Files.remove(path)
-                Config.event(:conflict_discarded, %{}, %{service: c.name, id: id, file: path})
-
-              {:ok, _} ->
-                key = c.prefix <> "conflicts/" <> id <> "/" <> suffix
-                md5 = Files.hash(path)
-
-                case Storage.call(c.storage, :put, [key, path, :absent, md5]) do
-                  {:ok, _} ->
-                    Files.remove(path)
-
-                  {:error, :precondition_failed} ->
-                    if Storage.call(c.storage, :head, [key]) == {:ok, md5}, do: Files.remove(path)
-
-                  {:error, _} ->
-                    :ok
-                end
-
-              {:error, _} ->
-                :ok
-            end
-          end
+              not Map.has_key?(deleting, id),
+              do: sweep_conflict(c, path, id, suffix)
 
           :swept
         end)
 
       %{s | tasks: Map.put(s.tasks, task.ref, task.pid), conflict_task: task.ref}
+    end
+  end
+
+  defp sweep_conflict(c, path, id, suffix) do
+    case Storage.call(c.storage, :head, [Config.key(c, id)]) do
+      {:error, :not_found} ->
+        Files.remove(path)
+        Config.event(:conflict_discarded, %{}, %{service: c.name, id: id, file: path})
+
+      {:ok, _} ->
+        key = c.prefix <> "conflicts/" <> id <> "/" <> suffix
+        md5 = Files.hash(path)
+
+        case Storage.call(c.storage, :put, [key, path, :absent, md5]) do
+          {:ok, _} ->
+            Files.remove(path)
+
+          {:error, :precondition_failed} ->
+            if Storage.call(c.storage, :head, [key]) == {:ok, md5}, do: Files.remove(path)
+
+          {:error, _} ->
+            :ok
+        end
+
+      {:error, _} ->
+        :ok
     end
   end
 
